@@ -1,131 +1,134 @@
+#!/usr/bin/env python3
+"""
+Flask + TinyLlama chatbot for Isvaryam.
+Works entirely on CPU and deploys on Render Free Tier.
+"""
+from __future__ import annotations
+
+import os
+import time
+import json
+import random
+import logging
+from collections import defaultdict
+from datetime import datetime
+
 from flask import Flask, request, jsonify, render_template
 from pymongo import MongoClient
-import json
-from datetime import datetime
-from difflib import get_close_matches
-import os  # <-- important for environment variable
+from bson import ObjectId
 
-app = Flask(__name__, static_url_path='/static', static_folder='static', template_folder='templates')
+# ─────────────────────────────────  LLM  ───────────────────────────────── #
+from llama_cpp import Llama, ChatMessage
 
-# Secure MongoDB connection using environment variable
-mongo_uri = os.environ.get("MONGO_URI")
-client = MongoClient(mongo_uri)
-db = client["isvaryam"]
-products = db["products"]
+LLAMA_MODEL_PATH = os.getenv("LLAMA_MODEL_PATH", "models/tinyllama.gguf")
+LLAMA_TEMP       = float(os.getenv("LLAMA_TEMP", "0.7"))
+LLAMA_TOP_P      = float(os.getenv("LLAMA_TOP_P", "0.95"))
+CTX_SIZE         = 2048   # keep within 1 GB RAM
 
+llm = Llama(
+    model_path = LLAMA_MODEL_PATH,
+    n_ctx      = CTX_SIZE,
+    n_threads  = os.cpu_count() or 2,
+    temperature= LLAMA_TEMP,
+    top_p      = LLAMA_TOP_P,
+)
 
-# Load local data
+# ───────────────────────────────  Flask & Mongo  ───────────────────────── #
+app = Flask(__name__,
+            static_url_path='/static',
+            static_folder='static',
+            template_folder='templates')
+
+logging.basicConfig(
+    filename='chatbot.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+MONGO_URI = os.environ.get("MONGO_URI", "")
+client    = MongoClient(MONGO_URI) if MONGO_URI else None
+db        = client["isvaryam"] if client else None
+products  = db["products"]  if db else None
+reviews   = db["reviews"]   if db else None
+
+# ─────────────────────────────  In‑memory state  ───────────────────────── #
+conversation_context: dict[str, dict] = defaultdict(dict)
+
+# ───────────────────────  Domain data (abridged sample)  ────────────────── #
 with open("ingredients.json") as f:
     ingredients_data = json.load(f)
 with open("contact.json") as f:
     contact_data = json.load(f)
+with open("faqs.json") as f:
+    faqs_data = json.load(f)
 
-# Aliases and recommendations
-alias_map = {
-    "combo pack": "super pack",
-    "oil combo": "super pack",
-    "3 oil combo": "super pack"
+product_data = {
+    "groundnut oil": {"description": "...", "benefits": ["..."], "attributes": {"rating": 4.7}},
+    "coconut oil":   {"description": "...", "benefits": ["..."], "attributes": {"rating": 4.9}},
+    # 🔎 add remaining products…
 }
+alias_map = {"combo pack": "super pack"}   # etc.
 
-recommendations = {
-    "groundnut oil": ["coconut oil", "sesame oil", "super pack"],
-    "coconut oil": ["sesame oil", "groundnut oil", "super pack"],
-    "sesame oil": ["groundnut oil", "coconut oil", "super pack"],
-    "ghee": ["jaggery powder"],
-    "jaggery powder": ["ghee"],
-    "super pack": ["groundnut oil", "coconut oil", "sesame oil"]
-}
+# ──────────────────────────  Intent detection (stub)  ───────────────────── #
+def detect_intent(text: str) -> str | None:
+    t = text.lower()
+    if any(greet in t for greet in ("hi", "hello", "hey")):
+        return "greet"
+    if "price" in t:
+        return "price"
+    # expand with your full keyword lists…
+    return None
 
-def get_greeting():
-    hour = datetime.now().hour
-    if hour < 12:
-        return "Good morning ☀️"
-    elif hour < 17:
-        return "Good afternoon 🌤️"
-    else:
-        return "Good evening 🌙"
+def handle_intents(text: str, user_id: str) -> str | None:
+    intent = detect_intent(text)
+    if intent == "greet":
+        hour = datetime.now().hour
+        sal  = "Good morning ☀️" if hour < 12 else (
+               "Good afternoon 🌤️" if hour < 17 else "Good evening 🌙")
+        return f"{sal} I'm Isvaryam's assistant. How can I help you?"
+    if intent == "price":
+        return "Our price list is coming right up! (demo reply)"
+    return None
 
+# ───────────────────────────────  Llama helper  ─────────────────────────── #
+def llama_chat(user_msg: str, history: list[ChatMessage]) -> str:
+    messages = history + [{"role": "user", "content": user_msg}]
+    res = llm.create_chat_completion(messages=messages, stream=False)
+    return res["choices"][0]["message"]["content"].strip()
+
+# ───────────────────────────────  Routes  ───────────────────────────────── #
 @app.route("/")
 def index():
     return render_template("index.html")
 
 @app.route("/chatbot", methods=["POST"])
 def chatbot():
-    user_input = request.json.get("message", "").lower()
+    user_msg = request.json.get("message", "")
+    user_id  = request.json.get("user_id", "anon")
 
-    # 1. Greeting intent
-    if any(greet in user_input for greet in ["hi", "hello", "good morning", "good afternoon", "good evening", "hey"]):
-        return jsonify(response=f"{get_greeting()}! I'm here to help you explore Isvaryam’s natural products. What would you like to know?")
+    # 1. keyword intents
+    intent_reply = handle_intents(user_msg, user_id)
+    if intent_reply:
+        return jsonify(response=intent_reply)
 
-    # 2. Contact info
-    if any(word in user_input for word in ["contact", "phone", "email", "address", "reach you"]):
-        return jsonify(response=(
-            f"You can reach us at:\n📞 {contact_data['phone']}\n"
-            f"✉️ {contact_data['email']}\n📍 {contact_data['address']}"
-        ))
+    # 2. fallback → TinyLlama
+    hist = conversation_context[user_id].get("history", [])
+    llama_reply = llama_chat(user_msg, hist)
 
-    # 3. Delivery info
-    if "delivery" in user_input or "shipping" in user_input:
-        return jsonify(response="We deliver to Coimbatore in 2 days 🚚 and to other cities in 3–4 days.")
+    # store limited history (keep last 10 exchanges)
+    hist.extend([
+        {"role": "user", "content": user_msg},
+        {"role": "assistant", "content": llama_reply}
+    ])
+    conversation_context[user_id]["history"] = hist[-10:]
 
-    # 4. Product listing
-    if any(word in user_input for word in ["products", "what do you have", "show all", "available items", "list items"]):
-        return jsonify(response="We currently offer: Groundnut Oil, Coconut Oil, Sesame Oil, Ghee, Jaggery Powder, and a Super Pack (1L each of 3 oils).")
+    return jsonify(response=llama_reply)
 
-    # 5. Normalize query and detect product
-    all_product_names = list(ingredients_data.keys()) + list(alias_map.keys())
-    words = user_input.split()
-    matched = get_close_matches(" ".join(words), all_product_names, n=1, cutoff=0.6)
-    pname = matched[0] if matched else None
-    if not pname:
-        for word in words:
-            match = get_close_matches(word, all_product_names, n=1, cutoff=0.8)
-            if match:
-                pname = match[0]
-                break
+@app.route("/feedback", methods=["POST"])
+def feedback():
+    logging.info(f"Feedback: {request.json}")
+    return jsonify(status="success")
 
-    if pname:
-        db_name = alias_map.get(pname, pname)
-        item = products.find_one({"name": {"$regex": db_name, "$options": "i"}})
-        if not item:
-            return jsonify(response=f"Sorry, I couldn't find any information for {db_name.title()}.")
-
-        response_parts = []
-
-        # 6. Price queries
-        if any(word in user_input for word in ["price", "cost", "rate", "how much"]):
-            prices = [f"{q['size']} - ₹{q['price']}" for q in item.get("quantities", [])]
-            response_parts.append(f"🛒 Prices for {db_name.title()}: {', '.join(prices)}")
-
-        # 7. Ingredient queries
-        if any(word in user_input for word in ["ingredient", "what is in", "contains", "made of"]):
-            if db_name in ingredients_data:
-                ingredients = ", ".join(ingredients_data[db_name])
-                response_parts.append(f"🧾 {db_name.title()} contains: {ingredients}")
-            else:
-                response_parts.append(f"ℹ️ {db_name.title()} includes a blend of our best oils.")
-
-        # 8. Image queries
-        if any(word in user_input for word in ["image", "photo", "pic", "picture", "show me"]):
-            imgs = item.get("images", [])[:3]
-            if imgs:
-                img_html = " ".join([f"<img src='{img}' width='100' style='margin:5px;'/>" for img in imgs])
-                response_parts.append(f"📸 Here are some images of {db_name.title()}:<br>{img_html}")
-
-        # 9. Description if nothing matched
-        if not response_parts:
-            description = item.get("description", "This is a premium product made with care.")
-            response_parts.append(f"📝 {db_name.title()}: {description}")
-
-        # 10. Recommendations
-        related = recommendations.get(db_name, [])
-        if related:
-            response_parts.append(f"🤝 Customers also buy: {', '.join([r.title() for r in related])}")
-
-        return jsonify(response="<br><br>".join(response_parts))
-
-    # Fallback
-    return jsonify(response="I'm sorry, I couldn't understand that. You can ask about product prices, ingredients, images, delivery info, or our contact details.")
-
+# ───────────────────────────────  Main  ─────────────────────────────────── #
 if __name__ == "__main__":
     app.run(debug=True)

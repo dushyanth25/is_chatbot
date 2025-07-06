@@ -1,0 +1,8 @@
+# Byte‑code & cache
+__pycache__/
+*.py[cod]
+*.log
+
+# Models & data
+models/
+.env
